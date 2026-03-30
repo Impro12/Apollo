@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>GraviVoyager</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+    canvas { display: block; touch-action: none; }
+  </style>
+</head>
+<body>
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+const PLANET_COLORS = [
+  0xff6b6b, 0xffa07a, 0x98d8c8, 0x87ceeb, 0xdda0dd,
+  0x90ee90, 0xf0e68c, 0xff69b4, 0x00ced1, 0xffd700,
+];
+
+const SHIP_SIZE       = 14;  // px from center to nose
+const SHIP_WING_ANGLE = 2.4; // radians — controls wing spread
+const SHIP_WING_SIZE  = 11;  // px from center to wing tips
+
+const MIN_VX          = 160; // px/s — minimum forward speed
+const MAX_SPEED       = 720; // px/s — velocity cap
+
+const FUEL_MAX        = 100;
+const FUEL_DRAIN_FLY  = 1.5; // units/s
+const FUEL_DRAIN_ORB  = 9.0; // units/s while orbiting
+
+const ORB_MIN_ANGVEL  = 1.2; // rad/s  — minimum orbit angular velocity
+const ORB_MAX_ANGVEL  = 4.0; // rad/s  — maximum
+const ORB_ACCEL       = 1.5; // rad/s² — how fast orbit speed builds
+const ORB_TIGHTEN     = 15;  // px/s   — orbit radius shrink rate
+const ORB_BOOST       = 1.4; // slingshot launch multiplier
+
+const CAM_LEAD        = 160; // px — how far ahead of ship the camera sits
+const CAM_LERP        = 0.08;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GameScene
+// ─────────────────────────────────────────────────────────────────────────────
+class GameScene extends Phaser.Scene {
+  constructor() {
+    super({ key: 'GameScene' });
+  }
+
+  // ── Phaser lifecycle ────────────────────────────────────────────────────────
+
+  create() {
+    const W = this.scale.width;
+    const H = this.scale.height;
+
+    this.cameras.main.setBackgroundColor('#080818');
+
+    // Background decoration (nebulae + stars) — built once, never cleared
+    this._createNebulae();
+    this._createStars();
+
+    // World graphics — cleared & redrawn every frame
+    this.planetGfx = this.add.graphics().setDepth(3);
+    this.shipGfx   = this.add.graphics().setDepth(4);
+
+    // HUD graphics — scroll-factor 0, redrawn every frame
+    this.hudGfx = this.add.graphics().setScrollFactor(0).setDepth(10);
+
+    // HUD text
+    this.fuelLabel = this.add.text(20, 22, 'FUEL', {
+      fontFamily: '"Courier New", monospace',
+      fontSize: '13px',
+      color: '#7788aa',
+    }).setScrollFactor(0).setDepth(11);
+
+    this.scoreText = this.add.text(W - 20, 22, '0 km', {
+      fontFamily: '"Courier New", monospace',
+      fontSize: '22px',
+      color: '#dde0ff',
+      stroke: '#00001a',
+      strokeThickness: 3,
+    }).setOrigin(1, 0).setScrollFactor(0).setDepth(11);
+
+    // "Hold to orbit" hint — fades after a few seconds
+    this.hintText = this.add.text(W / 2, H - 80, 'TAP & HOLD near a planet to orbit', {
+      fontFamily: '"Courier New", monospace',
+      fontSize: '14px',
+      color: '#6677aa',
+      stroke: '#000011',
+      strokeThickness: 2,
+      align: 'center',
+    }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(11);
+
+    this.tweens.add({
+      targets: this.hintText,
+      alpha: 0,
+      delay: 4000,
+      duration: 1500,
+    });
+
+    // Game Over overlay (hidden initially)
+    this._createGameOverOverlay(W, H);
+
+    // Input
+    this.input.on('pointerdown',   this._onPointerDown, this);
+    this.input.on('pointerup',     this._onPointerUp,   this);
+    this.input.on('pointercancel', this._onPointerUp,   this);
+
+    // Initialise game state (shared with restart)
+    this._initState(W, H);
+  }
+
+  update(_time, delta) {
+    if (this.gameState === 'dead') return;
+
+    // Clamp delta to prevent spiral-of-death on tab switch
+    const dt = Math.min(delta / 1000, 0.05);
+
+    // Drain fuel
+    const drain = this.gameState === 'orbiting' ? FUEL_DRAIN_ORB : FUEL_DRAIN_FLY;
+    this.fuel -= drain * dt;
+    if (this.fuel <= 0) {
+      this.fuel = 0;
+      this._die();
+      return;
+    }
+
+    // Physics step
+    if (this.gameState === 'orbiting') {
+      this._updateOrbit(dt);
+    } else {
+      this._updateFlight(dt);
+    }
+
+    // Camera follows ship X with smooth lerp
+    const targetScrollX = this.ship.x - CAM_LEAD;
+    this.cameras.main.scrollX += (targetScrollX - this.cameras.main.scrollX) * CAM_LERP;
+
+    // Planet spawning & cleanup
+    const camRight = this.cameras.main.scrollX + this.scale.width + 600;
+    this._spawnPlanets(camRight);
+    this._cleanupPlanets();
+
+    // Score = distance in "km" (arbitrary units)
+    this.distance = Math.max(this.distance, Math.floor((this.ship.x - this._startX) / 50));
+
+    // Vertical out-of-bounds death
+    const H = this.scale.height;
+    const cy = this.cameras.main.scrollY;
+    if (this.ship.y < cy - 80 || this.ship.y > cy + H + 80) {
+      this._die();
+      return;
+    }
+
+    // Render
+    this._render();
+  }
+
+  // ── State initialisation ────────────────────────────────────────────────────
+
+  _initState(W, H) {
+    const midY = (H || this.scale.height) / 2;
+
+    this.gameState    = 'playing';
+    this.isPointerDown = false;
+    this.orbit        = null;
+    this.fuel         = FUEL_MAX;
+    this.distance     = 0;
+
+    this.ship = { x: 150, y: midY, vx: 220, vy: 0 };
+    this.shipAngle = 0;
+    this._startX = this.ship.x;
+
+    this.planets     = [];
+    this.nextSpawnX  = (W || this.scale.width) + 100;
+
+    this.cameras.main.scrollX = 0;
+
+    this._spawnPlanets(this.scale.width + 600);
+  }
+
+  // ── Background setup (called once in create) ────────────────────────────────
+
+  _createNebulae() {
+    const W = this.scale.width;
+    const H = this.scale.height;
+    const gfx = this.add.graphics().setScrollFactor(0.05).setDepth(0);
+    const nebulaColors = [0x2a0a4a, 0x0a1a4a, 0x1a0a3a, 0x0a2a3a, 0x160a2e];
+
+    for (let i = 0; i < 10; i++) {
+      const col  = nebulaColors[i % nebulaColors.length];
+      const size = Phaser.Math.Between(300, 900);
+      gfx.fillStyle(col, 0.35);
+      gfx.fillCircle(Math.random() * 30000, Math.random() * H, size);
+    }
+  }
+
+  _createStars() {
+    const H      = this.scale.height;
+    const FIELD  = 250000;
+
+    // Far stars (tiny, dim, slow parallax)
+    const far = this.add.graphics().setScrollFactor(0.15).setDepth(1);
+    for (let i = 0; i < 700; i++) {
+      far.fillStyle(0xffffff, 0.2 + Math.random() * 0.3);
+      far.fillRect(Math.random() * FIELD, Math.random() * H, 1, 1);
+    }
+
+    // Near stars (slightly larger, faster parallax)
+    const near = this.add.graphics().setScrollFactor(0.38).setDepth(2);
+    for (let i = 0; i < 350; i++) {
+      near.fillStyle(0xffffff, 0.4 + Math.random() * 0.4);
+      near.fillRect(Math.random() * FIELD, Math.random() * H, 2, 2);
+    }
+  }
+
+  // ── Planet generation ───────────────────────────────────────────────────────
+
+  _spawnPlanets(untilX) {
+    const H = this.scale.height;
+    while (this.nextSpawnX < untilX) {
+      const gap    = Phaser.Math.Between(350, 650);
+      const radius = Phaser.Math.Between(35, 70);
+      this.planets.push({
+        x:          this.nextSpawnX,
+        y:          Phaser.Math.Between(Math.floor(H * 0.15), Math.floor(H * 0.85)),
+        radius,
+        color:      PLANET_COLORS[Phaser.Math.Between(0, PLANET_COLORS.length - 1)],
+        gravRadius: radius * 2.5,
+      });
+      this.nextSpawnX += gap;
+    }
+  }
+
+  _cleanupPlanets() {
+    const left = this.cameras.main.scrollX - 400;
+    this.planets = this.planets.filter(p => p.x > left);
+  }
+
+  // ── Input handlers ──────────────────────────────────────────────────────────
+
+  _onPointerDown() {
+    this.isPointerDown = true;
+    if (this.gameState === 'dead') {
+      this._restart();
+      return;
+    }
+    // Immediate orbit attempt on tap (also checked continuously in _updateFlight)
+    if (this.gameState === 'playing') {
+      this._tryEnterOrbit();
+    }
+  }
+
+  _onPointerUp() {
+    this.isPointerDown = false;
+    if (this.gameState === 'orbiting') {
+      this._releaseOrbit();
+    }
+  }
+
+  // ── Orbit helpers ───────────────────────────────────────────────────────────
+
+  _tryEnterOrbit() {
+    let best     = null;
+    let bestDist = Infinity;
+
+    for (const p of this.planets) {
+      const dx   = this.ship.x - p.x;
+      const dy   = this.ship.y - p.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < p.gravRadius && dist < bestDist) {
+        bestDist = dist;
+        best     = p;
+      }
+    }
+
+    if (best) this._startOrbit(best);
+  }
+
+  _startOrbit(planet) {
+    const dx   = this.ship.x - planet.x;
+    const dy   = this.ship.y - planet.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    const angle = Math.atan2(dy, dx);
+
+    // Tangential speed (CCW positive): v · tangent_CCW
+    // tangent_CCW of radius unit (dx/dist, dy/dist) is (-dy/dist, dx/dist)
+    const tangVel = this.ship.vx * (-dy / dist) + this.ship.vy * (dx / dist);
+    let angVel    = tangVel / dist;
+
+    // Enforce minimum, choosing sign from cross product if needed
+    if (Math.abs(angVel) < ORB_MIN_ANGVEL) {
+      // cross product of radius × velocity: sign tells CW vs CCW
+      const cross = (dx / dist) * this.ship.vy - (dy / dist) * this.ship.vx;
+      angVel = cross <= 0 ? -ORB_MIN_ANGVEL : ORB_MIN_ANGVEL;
+    }
+
+    const orbitRadius = Math.max(dist, planet.radius + 25);
+
+    // Snap ship cleanly onto orbit circle
+    this.ship.x = planet.x + Math.cos(angle) * orbitRadius;
+    this.ship.y = planet.y + Math.sin(angle) * orbitRadius;
+
+    this.orbit = { planet, radius: orbitRadius, angle, angVel };
+    this.gameState = 'orbiting';
+  }
+
+  _releaseOrbit() {
+    const { radius, angle, angVel } = this.orbit;
+
+    // Orbital velocity vector: d/dt (r·cos(a), r·sin(a)) = r·ω·(-sin(a), cos(a))
+    const speed = radius * Math.abs(angVel) * ORB_BOOST;
+    const dir   = Math.sign(angVel);
+
+    let vx = -Math.sin(angle) * speed * dir;
+    let vy =  Math.cos(angle) * speed * dir;
+
+    // Safety: ensure forward momentum so the game stays fun
+    if (vx < 100) {
+      vx = Math.abs(vx) + 80;
+      vy *= 0.5;
+    }
+
+    this.ship.vx = vx;
+    this.ship.vy = vy;
+
+    this.orbit     = null;
+    this.gameState = 'playing';
+  }
+
+  // ── Physics update ──────────────────────────────────────────────────────────
+
+  _updateFlight(dt) {
+    // Check for continuous orbit entry while pointer is held
+    if (this.isPointerDown) {
+      this._tryEnterOrbit();
+      if (this.gameState === 'orbiting') return;
+    }
+
+    // Speed cap
+    const spd = Math.sqrt(this.ship.vx ** 2 + this.ship.vy ** 2);
+    if (spd > MAX_SPEED) {
+      this.ship.vx = (this.ship.vx / spd) * MAX_SPEED;
+      this.ship.vy = (this.ship.vy / spd) * MAX_SPEED;
+    }
+
+    // Gentle drag
+    this.ship.vx *= Math.pow(0.9985, dt * 60);
+    this.ship.vy *= Math.pow(0.997,  dt * 60);
+
+    // Gradually restore minimum forward speed (feels like engine thrust)
+    if (this.ship.vx < MIN_VX) {
+      this.ship.vx += (MIN_VX - this.ship.vx) * 0.015;
+    }
+
+    // Integrate position
+    this.ship.x += this.ship.vx * dt;
+    this.ship.y += this.ship.vy * dt;
+
+    // Smoothly rotate ship sprite toward velocity direction
+    const targetAngle = Math.atan2(this.ship.vy, this.ship.vx);
+    // Handle angle wrapping
+    let diff = targetAngle - this.shipAngle;
+    if (diff >  Math.PI) diff -= 2 * Math.PI;
+    if (diff < -Math.PI) diff += 2 * Math.PI;
+    this.shipAngle += diff * 0.12;
+  }
+
+  _updateOrbit(dt) {
+    const orb = this.orbit;
+
+    // Accelerate angular velocity (slingshot wind-up)
+    orb.angVel += ORB_ACCEL * dt * Math.sign(orb.angVel);
+    orb.angVel  = Phaser.Math.Clamp(orb.angVel, -ORB_MAX_ANGVEL, ORB_MAX_ANGVEL);
+
+    // Tighten orbit radius
+    const minR  = orb.planet.radius + 22;
+    orb.radius  = Math.max(minR, orb.radius - ORB_TIGHTEN * dt);
+
+    // Advance angle
+    orb.angle  += orb.angVel * dt;
+
+    // Update ship world position
+    this.ship.x = orb.planet.x + Math.cos(orb.angle) * orb.radius;
+    this.ship.y = orb.planet.y + Math.sin(orb.angle) * orb.radius;
+
+    // Ship points tangentially in direction of travel
+    this.shipAngle = orb.angle + (orb.angVel >= 0 ? Math.PI / 2 : -Math.PI / 2);
+  }
+
+  // ── Rendering ───────────────────────────────────────────────────────────────
+
+  _render() {
+    this.planetGfx.clear();
+    this.shipGfx.clear();
+    this.hudGfx.clear();
+
+    this._drawPlanets();
+    this._drawShip();
+    this._drawHUD();
+  }
+
+  _drawPlanets() {
+    const gfx = this.planetGfx;
+
+    for (const p of this.planets) {
+      // Gravity field aura
+      gfx.fillStyle(p.color, 0.06);
+      gfx.fillCircle(p.x, p.y, p.gravRadius);
+      gfx.lineStyle(1, p.color, 0.22);
+      gfx.strokeCircle(p.x, p.y, p.gravRadius);
+
+      // Active orbit ring
+      if (this.orbit && this.orbit.planet === p) {
+        gfx.lineStyle(1.5, 0xffffff, 0.3);
+        gfx.strokeCircle(p.x, p.y, this.orbit.radius);
+      }
+
+      // Planet body
+      gfx.fillStyle(p.color, 1);
+      gfx.fillCircle(p.x, p.y, p.radius);
+
+      // Specular highlight (top-left)
+      gfx.fillStyle(0xffffff, 0.16);
+      gfx.fillCircle(
+        p.x - p.radius * 0.3,
+        p.y - p.radius * 0.3,
+        p.radius * 0.48
+      );
+
+      // Shadow (bottom-right)
+      gfx.fillStyle(0x000000, 0.28);
+      gfx.fillCircle(
+        p.x + p.radius * 0.22,
+        p.y + p.radius * 0.22,
+        p.radius * 0.58
+      );
+    }
+  }
+
+  _drawShip() {
+    const gfx = this.shipGfx;
+    const { x, y } = this.ship;
+    const a  = this.shipAngle;
+
+    // Engine glow (behind ship)
+    const glowAlpha  = this.gameState === 'orbiting' ? 0.7 : 0.4;
+    const glowRadius = this.gameState === 'orbiting' ? 11 : 8;
+    gfx.fillStyle(0xff8833, glowAlpha);
+    gfx.fillCircle(
+      x - Math.cos(a) * (SHIP_SIZE - 2),
+      y - Math.sin(a) * (SHIP_SIZE - 2),
+      glowRadius
+    );
+
+    // Outer soft glow halo
+    gfx.fillStyle(0xff6600, 0.12);
+    gfx.fillCircle(
+      x - Math.cos(a) * (SHIP_SIZE - 2),
+      y - Math.sin(a) * (SHIP_SIZE - 2),
+      glowRadius * 2.2
+    );
+
+    // Ship triangle
+    const nose  = { x: x + Math.cos(a) * SHIP_SIZE,                     y: y + Math.sin(a) * SHIP_SIZE };
+    const wingL = { x: x + Math.cos(a + SHIP_WING_ANGLE) * SHIP_WING_SIZE, y: y + Math.sin(a + SHIP_WING_ANGLE) * SHIP_WING_SIZE };
+    const wingR = { x: x + Math.cos(a - SHIP_WING_ANGLE) * SHIP_WING_SIZE, y: y + Math.sin(a - SHIP_WING_ANGLE) * SHIP_WING_SIZE };
+
+    // White fill
+    gfx.fillStyle(0xffffff, 1);
+    gfx.fillTriangle(nose.x, nose.y, wingL.x, wingL.y, wingR.x, wingR.y);
+
+    // Blue-tinted outline for crispness
+    gfx.lineStyle(1.5, 0xaabbff, 0.7);
+    gfx.strokeTriangle(nose.x, nose.y, wingL.x, wingL.y, wingR.x, wingR.y);
+  }
+
+  _drawHUD() {
+    const gfx    = this.hudGfx;
+    const W      = this.scale.width;
+    const BAR_X  = 20;
+    const BAR_Y  = 42;
+    const BAR_W  = 150;
+    const BAR_H  = 13;
+    const ratio  = this.fuel / FUEL_MAX;
+
+    // Bar backing
+    gfx.fillStyle(0x0a0a2a, 0.9);
+    gfx.fillRoundedRect(BAR_X - 2, BAR_Y - 2, BAR_W + 4, BAR_H + 4, 5);
+
+    gfx.fillStyle(0x111133, 1);
+    gfx.fillRoundedRect(BAR_X, BAR_Y, BAR_W, BAR_H, 4);
+
+    // Fuel fill
+    if (ratio > 0) {
+      let fuelColor;
+      if (ratio > 0.5)      fuelColor = 0x44eeaa;
+      else if (ratio > 0.25) fuelColor = 0xffcc44;
+      else                   fuelColor = 0xff4455;
+
+      gfx.fillStyle(fuelColor, 1);
+      gfx.fillRoundedRect(BAR_X, BAR_Y, Math.max(4, BAR_W * ratio), BAR_H, 4);
+
+      // Inner shine
+      gfx.fillStyle(0xffffff, 0.15);
+      gfx.fillRoundedRect(BAR_X + 2, BAR_Y + 1, Math.max(2, BAR_W * ratio - 4), Math.floor(BAR_H / 2 - 1), 3);
+    }
+
+    // Bar border
+    gfx.lineStyle(1.5, 0x3344aa, 1);
+    gfx.strokeRoundedRect(BAR_X, BAR_Y, BAR_W, BAR_H, 4);
+
+    // Orbit indicator dot (top-right) – pulses while orbiting
+    if (this.gameState === 'orbiting') {
+      gfx.fillStyle(0x66ffcc, 0.9);
+      gfx.fillCircle(W - 28, 28, 7);
+      gfx.lineStyle(2, 0x66ffcc, 0.35);
+      gfx.strokeCircle(W - 28, 28, 14);
+    }
+
+    // Low-fuel warning flash (rapid blink via time)
+    if (ratio < 0.25 && Math.floor(Date.now() / 250) % 2 === 0) {
+      gfx.lineStyle(2, 0xff4455, 0.8);
+      gfx.strokeRoundedRect(BAR_X - 2, BAR_Y - 2, BAR_W + 4, BAR_H + 4, 5);
+    }
+
+    // Update score text (done here to keep it in one place)
+    this.scoreText.setText(this.distance + ' km');
+  }
+
+  // ── Game Over / Restart ─────────────────────────────────────────────────────
+
+  _createGameOverOverlay(W, H) {
+    this.goContainer = this.add.container(W / 2, H / 2)
+      .setScrollFactor(0)
+      .setDepth(20)
+      .setVisible(false);
+
+    // Background panel
+    const panel = this.add.graphics();
+    panel.fillStyle(0x000022, 0.8);
+    panel.fillRoundedRect(-190, -120, 380, 240, 18);
+    panel.lineStyle(1.5, 0x2233aa, 0.6);
+    panel.strokeRoundedRect(-190, -120, 380, 240, 18);
+    this.goContainer.add(panel);
+
+    // Title
+    const title = this.add.text(0, -70, 'GAME OVER', {
+      fontFamily: '"Courier New", monospace',
+      fontSize: '32px',
+      color: '#ff4466',
+      stroke: '#000011',
+      strokeThickness: 4,
+    }).setOrigin(0.5);
+    this.goContainer.add(title);
+
+    // Score line
+    this.goScoreText = this.add.text(0, -15, '', {
+      fontFamily: '"Courier New", monospace',
+      fontSize: '20px',
+      color: '#aabbdd',
+      stroke: '#000011',
+      strokeThickness: 2,
+    }).setOrigin(0.5);
+    this.goContainer.add(this.goScoreText);
+
+    // Restart prompt
+    this.goRestartText = this.add.text(0, 55, 'TAP TO RESTART', {
+      fontFamily: '"Courier New", monospace',
+      fontSize: '19px',
+      color: '#66ffcc',
+      stroke: '#000011',
+      strokeThickness: 3,
+    }).setOrigin(0.5);
+    this.goContainer.add(this.goRestartText);
+
+    // Blink tween
+    this.tweens.add({
+      targets: this.goRestartText,
+      alpha: 0.1,
+      duration: 550,
+      yoyo: true,
+      repeat: -1,
+    });
+  }
+
+  _die() {
+    if (this.gameState === 'dead') return;
+    this.gameState = 'dead';
+    this.orbit     = null;
+
+    this.goScoreText.setText('Distance: ' + this.distance + ' km');
+    this.goContainer.setVisible(true);
+
+    // Small screen shake
+    this.cameras.main.shake(250, 0.01);
+  }
+
+  _restart() {
+    this.goContainer.setVisible(false);
+    this._initState();
+
+    // Fade hint back in
+    this.hintText.setAlpha(1);
+    this.tweens.add({
+      targets: this.hintText,
+      alpha: 0,
+      delay: 4000,
+      duration: 1500,
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phaser game config
+// ─────────────────────────────────────────────────────────────────────────────
+const config = {
+  type: Phaser.AUTO,
+  width: 480,
+  height: 800,
+  backgroundColor: '#080818',
+  scale: {
+    mode: Phaser.Scale.FIT,
+    autoCenter: Phaser.Scale.CENTER_BOTH,
+  },
+  scene: [GameScene],
+};
+
+// eslint-disable-next-line no-unused-vars
+const game = new Phaser.Game(config);
+</script>
+</body>
+</html>
